@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Control</title>
+<style>
+    [data-online="true"]  { color: green; font-weight: bold; }
+    [data-online="false"] { color: red;   font-weight: bold; }
+</style>
+</head>
+<body>
+
+<!-- ===== Your simple HTML ===== -->
+<p>
+    State: <span data-plc-online></span> |
+    PLC time: <span data-plc-time></span>
+</p>
+
+<table border="1" style="border-collapse: collapse">
+    <tr>
+        <td>B_TestBool</td>
+        <td data-plc-out="B_TestBool"></td>
+        <td>
+            <select data-plc-in="B_TestBool">
+                <option value="TRUE">TRUE</option>
+                <option value="FALSE">FALSE</option>
+            </select>
+            <button data-plc-set="B_TestBool" data-value="1">Set TRUE</button>
+            <button data-plc-set="B_TestBool" data-value="0">Set FALSE</button>
+        </td>
+    </tr>
+    <tr>
+        <td>W_TestWord</td>
+        <td data-plc-out="W_TestWord"></td>
+        <td><input data-plc-in="W_TestWord" size="9" placeholder="dec / 16#hex"></td>
+    </tr>
+    <tr>
+        <td>I_TestInt</td>
+        <td data-plc-out="I_TestInt"></td>
+        <td>
+            <input data-plc-in="I_TestInt" size="9">
+            <button data-plc-set="I_TestInt" data-value="42">Set 42</button>
+        </td>
+    </tr>
+     <tr>
+        <td>Checkbox B_TestBool</td>
+        <td colspan="2"><input type="checkbox" data-plc-in="DB_TestDataWeb.B_TestBool"></td>
+    </tr>
+</table>
+
+<script>
+// remove stray text in front of the page (damaged file header)
+(function () {
+    function clean() {
+        Array.from(document.body.childNodes).forEach(function (n) {
+            if (n.nodeType === 3 && n.textContent.trim()) n.remove();
+        });
+    }
+    clean();
+    document.addEventListener("DOMContentLoaded", clean);
+})();
+
+
+// ---------------------------------------------------------------
+// Hidden connection to the PLC variable table
+// ---------------------------------------------------------------
+const PlcWeb = {
+    url: "/Portal/Portal.mwsl?PriNav=Vartables",
+    frame: null,
+    vars: {},
+    busy: false,
+    listeners: [],          // called after every reload
+    onlineListeners: [],    // called when the online state changes
+
+    // Live time / online state
+    time: null,             // Date object of the PLC clock (or null)
+    timeText: "",           // raw text "10/17/2026 07:01:23 pm"
+    online: false,
+    lastChange: 0,          // when the PLC time last changed (local ms)
+    offlineAfterMs: 10000,  // time frozen for this long -> offline
+    loadTimeoutMs: 5000,    // iframe did not load in this time -> offline
+
+    clean(text) {
+        return String(text).replace(/"/g, "").trim();
+    },
+
+    onUpdate(fn) { this.listeners.push(fn); },
+    onOnline(fn) { this.onlineListeners.push(fn); },   // fn(online)
+
+    init(refreshMs = 3000) {
+        this.frame = document.createElement("iframe");
+        this.frame.style.display = "none";
+        document.documentElement.appendChild(this.frame);
+        this.reload();
+        if (refreshMs) {
+            setInterval(() => { if (!this.busy) this.reload(); }, refreshMs);
+        }
+    },
+
+    reload() {
+        return new Promise(resolve => {
+            let done = false;
+            const finish = ok => {
+                if (done) return;
+                done = true;
+                clearTimeout(timer);
+                if (ok) {
+                    this.readTime();
+                    if (this.online) { this.scan(); this.updateAll(); }
+                } else {
+                    this.setOnline(false);
+                }
+                this.listeners.forEach(fn => fn());
+                resolve(this);
+            };
+            const timer = setTimeout(() => finish(false), this.loadTimeoutMs);
+            this.frame.onload = () => finish(true);
+            this.frame.src = this.url;
+        });
+    },
+
+    // ----- live time + online state -----
+
+    // Parse "10/17/2026" (m/d/y), "17.10.2026" (d.m.y), "2026-10-17" (y-m-d)
+    // and "07:01:23 pm" or "19:01:23"
+    parseTime(dateStr, timeStr) {
+        const d = dateStr.match(/(\d+)([\/.\-])(\d+)[\/.\-](\d+)/);
+        const t = timeStr.match(/(\d+):(\d+):(\d+)\s*([ap]m)?/i);
+        if (!d || !t) return null;
+
+        let y, mo, da;
+        if (d[2] === "/")                 { mo = +d[1]; da = +d[3]; y = +d[4]; }
+        else if (d[1].length === 4)       { y = +d[1];  mo = +d[3]; da = +d[4]; }
+        else                              { da = +d[1]; mo = +d[3]; y = +d[4]; }
+
+        let h = +t[1];
+        if (t[4]) h = (h % 12) + (/pm/i.test(t[4]) ? 12 : 0);
+        return new Date(y, mo - 1, da, h, +t[2], +t[3]);
+    },
+
+    // Read the clock from the loaded iframe and decide online / offline
+    readTime() {
+        let dateEl = null, timeEl = null;
+        try {
+            const d = this.frame.contentDocument;
+            dateEl = d && d.getElementById("date");
+            timeEl = d && d.getElementById("time");
+        } catch (e) { /* cross-origin / error page */ }
+
+        if (!dateEl || !timeEl) {
+            this.time = null;
+            this.timeText = "";
+            return this.setOnline(false);
+        }
+
+        const text = dateEl.textContent.trim() + " " + timeEl.textContent.trim();
+        if (text !== this.timeText) {          // the clock moved -> PLC is alive
+            this.timeText = text;
+            this.lastChange = Date.now();
+        }
+        this.time = this.parseTime(dateEl.textContent, timeEl.textContent);
+        this.setOnline(Date.now() - this.lastChange < this.offlineAfterMs);
+    },
+
+    setOnline(state) {
+        if (state === this.online) return;
+        this.online = state;
+        this.onlineListeners.forEach(fn => fn(state));
+    },
+
+    // ----- variables -----
+
+    rows() {
+        let d = null;
+        try { d = this.frame && this.frame.contentDocument; } catch (e) {}
+        if (!d) return [];
+        return Array.from(d.getElementsByTagName("tr")).filter(tr => {
+            const td = tr.getElementsByTagName("td")[0];
+            return td && tr.querySelector("[id^=val_t]");
+        });
+    },
+
+    rowName(tr) {
+        return this.clean(tr.getElementsByTagName("td")[0].textContent);
+    },
+
+    scan() {
+        for (const tr of this.rows()) {
+            const full = this.rowName(tr);
+            if (!this.vars[full]) this.vars[full] = new PlcVariable(full);
+        }
+        return this.vars;
+    },
+
+    updateAll() {
+        Object.values(this.vars).forEach(v => v.update());
+    },
+
+    list() {
+        const out = Object.values(this.vars).map(v => ({
+            name: v.name, fullName: v.fullName, value: v.value
+        }));
+        console.table(out);
+        return out;
+    },
+
+    get(name) {
+        name = this.clean(name);
+        return this.vars[name] ||
+            Object.values(this.vars).find(v => v.name === name) || null;
+    }
+};
+
+class PlcVariable {
+    constructor(fullName) {
+        this.fullName = PlcWeb.clean(fullName);
+        this.name = this.fullName.split(".").pop();
+        this.value = null;
+    }
+
+    get row() {
+        return PlcWeb.rows().find(tr => PlcWeb.rowName(tr) === this.fullName) || null;
+    }
+
+    update() {
+        const r = this.row;
+        const v = r && r.querySelector("[id^=val_t]");
+        this.value = v ? v.textContent.trim() : null;
+        return this.value;
+    }
+
+    async reload() {
+        await PlcWeb.reload();
+        return this.update();
+    }
+
+    format(value) {
+        const cur = this.value || "";
+        if (/^(TRUE|FALSE)$/i.test(cur)) {
+            return (value === true || value === 1 || /^(1|true)$/i.test(String(value)))
+                ? "TRUE" : "FALSE";
+        }
+        if (/^16#/i.test(cur) || /^16#/i.test(String(value))) {
+            const s = String(value).trim();
+            const n = /^16#/i.test(s) ? parseInt(s.slice(3), 16) : parseInt(s, 10);
+            if (isNaN(n) || n < 0 || n > 65535) return null;
+            return "16#" + ("000" + n.toString(16).toUpperCase()).slice(-4);
+        }
+        return String(value);
+    }
+
+    async write(value) {
+        if (!PlcWeb.online) throw new Error("PLC offline, cannot write " + this.fullName);
+
+        const t = this.format(value);
+        if (t === null) throw new Error("bad value for " + this.fullName);
+
+        const r = this.row;
+        if (!r) throw new Error("row " + this.fullName + " not found");
+
+        const inp = r.querySelector("input[type=text]");
+        const ap  = r.querySelector("input[type=submit]");
+        if (!inp || !ap) throw new Error("input/Apply not found in row");
+
+        PlcWeb.busy = true;
+        try {
+            inp.value = t;
+            ap.click();
+            await new Promise(res => setTimeout(res, 1200));
+            await this.reload();
+        } finally {
+            PlcWeb.busy = false;
+        }
+        return this.value;
+    }
+}
+
+// ---------------------------------------------------------------
+// Simple HTML parser: binds data-plc-* attributes
+//
+//   data-plc-out="Name"                 show the value
+//   data-plc-in="Name"                  input / select / checkbox
+//   data-plc-set="Name" data-value="x"  button writes x on click
+//   data-plc-time                       show the PLC clock
+//   data-plc-online                     show ONLINE / OFFLINE and set
+//                                       data-online="true|false" (for CSS)
+//                                       optional: data-text-on / data-text-off
+// ---------------------------------------------------------------
+const PlcBind = {
+    outs: [],
+    ins: [],
+    times: [],
+    states: [],
+
+    write(name, value) {
+        const v = PlcWeb.get(name);
+        if (!v) return console.warn("PlcBind: variable not found:", name);
+        v.write(value).catch(e => console.error("PlcBind:", e.message));
+    },
+
+    parse(root = document) {
+        this.outs   = Array.from(root.querySelectorAll("[data-plc-out]"));
+        this.ins    = Array.from(root.querySelectorAll("[data-plc-in]"));
+        this.times  = Array.from(root.querySelectorAll("[data-plc-time]"));
+        this.states = Array.from(root.querySelectorAll("[data-plc-online]"));
+
+        this.ins.forEach(el => {
+            if (el._plcBound) return;
+            el._plcBound = true;
+            el.addEventListener("change", () => {
+                const val = el.type === "checkbox" ? el.checked : el.value;
+                this.write(el.dataset.plcIn, val);
+            });
+        });
+
+        root.querySelectorAll("[data-plc-set]").forEach(el => {
+            if (el._plcBound) return;
+            el._plcBound = true;
+            el.addEventListener("click", () => {
+                this.write(el.dataset.plcSet, el.dataset.value);
+            });
+        });
+    },
+
+    refresh() {
+        const on = PlcWeb.online;
+
+        this.states.forEach(el => {
+            el.dataset.online = on;
+            el.textContent = on ? (el.dataset.textOn || "ONLINE")
+                                : (el.dataset.textOff || "OFFLINE");
+        });
+
+        this.times.forEach(el => {
+            el.textContent = PlcWeb.timeText || "?";
+        });
+
+        this.outs.forEach(el => {
+            const v = PlcWeb.get(el.dataset.plcOut);
+            el.textContent = on && v && v.value !== null ? v.value : "?";
+        });
+
+        if (!on) return;   // keep the inputs untouched while offline
+        this.ins.forEach(el => {
+            if (document.activeElement === el) return;
+            const v = PlcWeb.get(el.dataset.plcIn);
+            if (!v || v.value === null) return;
+            if (el.type === "checkbox") el.checked = /^true$/i.test(v.value);
+            else el.value = v.value;
+        });
+    }
+};
+
+// ---------------------------------------------------------------
+// Start
+// ---------------------------------------------------------------
+PlcBind.parse();
+PlcWeb.onUpdate(() => PlcBind.refresh());
+PlcWeb.onOnline(on => console.log("PLC is", on ? "ONLINE" : "OFFLINE"));
+PlcWeb.init(1000);
+
+// From JS you can also use:
+//   PlcWeb.online      // true / false
+//   PlcWeb.time        // Date object of the PLC clock
+//   PlcWeb.timeText    // "10/17/2026 07:01:23 pm"
+</script>
+</body>
+</html>
